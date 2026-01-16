@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>MentorPi Command Center v7.1 (Fixed)</title>
+    <script src="https://code.createjs.com/1.0.0/easeljs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/eventemitter2@6.4.9/lib/eventemitter2.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/roslib@1/build/roslib.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/ros2d@0.9.0/build/ros2d.min.js"></script>
+
+    <style>
+        body { margin: 0; background: #0b0e14; color: #fff; font-family: sans-serif; overflow: hidden; }
+        #header { height: 50px; background: #1a1f2b; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; border-bottom: 2px solid #00e5ff; }
+        #map { width: 100vw; height: calc(100vh - 130px); background: #1c222d; cursor: crosshair; } 
+        .footer { height: 80px; background: #151921; display: flex; align-items: center; justify-content: center; gap: 15px; }
+        button { padding: 12px 25px; font-weight: bold; cursor: pointer; border: none; border-radius: 6px; }
+        .btn-mode { background: #333; color: #fff; border: 1px solid #555; }
+        .btn-mode.active { background: #00e5ff; color: #000; box-shadow: 0 0 10px #00e5ff; }
+        .btn-red { background: #ff3d00; color: #fff; }
+        #status-msg { color: #00e5ff; font-weight: bold; }
+    </style>
+
+    <script type="text/javascript">
+        // [설정] 로봇 IP 확인 필수
+        var ros = new ROSLIB.Ros({ 
+            url : 'ws://172.16.10.172:9091' 
+        });
+
+        var viewer, gridClient, robotMarker, pathShape;
+        var currentMode = 'GOAL'; 
+        var isStopping = false;
+        
+        // 클릭/드래그 구분용 변수
+        var isPanning = false;
+        var clickStartX, clickStartY;
+
+        function init() {
+            // 1. 뷰어 생성
+            viewer = new ROS2D.Viewer({ divID : 'map', width : window.innerWidth, height : window.innerHeight - 130 });
+            
+            // [핵심 수정] 빈 공간 클릭 감지용 투명 배경판 생성
+            // 맵 크기보다 훨씬 크게(-500m ~ 500m) 깔아서 어디를 눌러도 감지되게 함
+            var backgroundHitArea = new createjs.Shape();
+            backgroundHitArea.graphics.beginFill("#FFFFFF").drawRect(-10000, -10000, 20000, 20000);
+            backgroundHitArea.alpha = 0.01; // 거의 투명함 (0으로 하면 클릭 안 먹힘)
+            backgroundHitArea.cursor = "crosshair";
+            viewer.scene.addChild(backgroundHitArea); // 가장 먼저 추가해서 바닥에 깝니다.
+
+            // 2. 맵 클라이언트
+            gridClient = new ROS2D.OccupancyGridClient({
+                ros : ros,
+                rootObject : viewer.scene,
+                topic : '/map',
+                continuous : true,
+                transportOptions: { queue_size: 1, latch: true } 
+            });
+
+            // 3. 경로선 (클릭 방해하지 않도록 설정)
+            pathShape = new ROS2D.PathShape({ ros: ros, strokeSize: 0.05, strokeColor: "#00e5ff" });
+            pathShape.mouseEnabled = false; 
+            viewer.scene.addChild(pathShape);
+
+            // 4. 로봇 마커 (클릭 방해하지 않도록 설정)
+            robotMarker = new createjs.Container();
+            var arrowBody = new createjs.Shape();
+            arrowBody.graphics.beginFill("#ff4400").moveTo(0.35, 0).lineTo(-0.2, 0.25).lineTo(-0.1, 0).lineTo(-0.2, -0.25).closePath();
+            robotMarker.addChild(arrowBody);
+            robotMarker.scaleX = 0.03; robotMarker.scaleY = 0.03;
+            robotMarker.mouseEnabled = false; // 마커 클릭 무시 (바닥을 클릭해야 함)
+
+            // 5. TF 수신
+            var tfTopic = new ROSLIB.Topic({ ros: ros, name: '/tf', messageType: 'tf2_msgs/msg/TFMessage', latch: true });
+            tfTopic.subscribe(function(msg) {
+                msg.transforms.forEach(function(tf) {
+                    var name = tf.child_frame_id.toLowerCase();
+                    if (name.includes('link') || name.includes('footprint') || name.includes('base')) {
+                        robotMarker.x = tf.transform.translation.x;
+                        robotMarker.y = -tf.transform.translation.y;
+                        var r = tf.transform.rotation;
+                        var yaw = Math.atan2(2*(r.w*r.z+r.x*r.y), 1-2*(r.y*r.y+r.z*r.z));
+                        robotMarker.rotation = -yaw * (180 / Math.PI); 
+                        if (!viewer.scene.contains(robotMarker)) {
+                            viewer.scene.addChild(robotMarker);
+                            centerOnRobot();
+                        }
+                    }
+                });
+            });
+
+            // 6. 이벤트 리스너 등록 (줌/팬/클릭 통합 관리)
+            registerInteraction();
+
+            // 연결 상태 표시
+            ros.on('connection', () => { document.getElementById('status-msg').innerText = "🟢 시스템 온라인"; });
+            ros.on('error', (err) => { document.getElementById('status-msg').innerText = "🔴 연결 실패 (ws server 확인)"; });
+            ros.on('close', () => { document.getElementById('status-msg').innerText = "⚪ 연결 종료"; });
+        }
+
+        function registerInteraction() {
+            var canvas = document.getElementById('map').querySelector('canvas');
+
+            // [기능 1] 마우스 휠 줌 (Native)
+            canvas.addEventListener('wheel', function(e) {
+                e.preventDefault();
+                var zoomFactor = 1.1;
+                var local = viewer.scene.globalToLocal(e.offsetX, e.offsetY);
+                if (e.deltaY < 0) { viewer.scene.scaleX *= zoomFactor; viewer.scene.scaleY *= zoomFactor; }
+                else { viewer.scene.scaleX /= zoomFactor; viewer.scene.scaleY /= zoomFactor; }
+                viewer.scene.x = e.offsetX - local.x * viewer.scene.scaleX;
+                viewer.scene.y = e.offsetY - local.y * viewer.scene.scaleY;
+            });
+
+            // [기능 2] 맵 이동 (Native Mouse Events)
+            var startPanX, startPanY;
+            
+            canvas.addEventListener('mousedown', function(e) {
+                isPanning = false;
+                startPanX = e.clientX;
+                startPanY = e.clientY;
+            });
+
+            window.addEventListener('mousemove', function(e) {
+                if (e.buttons === 1) { // 왼쪽 버튼 누른 채 이동
+                    var dx = e.clientX - startPanX;
+                    var dy = e.clientY - startPanY;
+                    if (Math.abs(dx) > 5 || Math.abs(dy) > 5) {
+                        isPanning = true; // 조금이라도 움직이면 팬 모드로 간주
+                        viewer.scene.x += dx;
+                        viewer.scene.y += dy;
+                        startPanX = e.clientX;
+                        startPanY = e.clientY;
+                    }
+                }
+            });
+
+            // [기능 3] 목적지 설정 (CreateJS Stage Event)
+            // 투명 배경판 덕분에 어디를 눌러도 이 이벤트가 발생함
+            viewer.scene.addEventListener('stagemousedown', function(event) {
+                clickStartX = event.stageX;
+                clickStartY = event.stageY;
+            });
+
+            viewer.scene.addEventListener('stagemouseup', function(event) {
+                // 1. 팬(드래그) 중이었다면 목적지 설정 안함
+                if (isPanning) return;
+
+                // 2. 클릭 시작점과 끝점 차이가 크면 드래그로 간주 (손떨림 보정 10px)
+                var diffX = Math.abs(event.stageX - clickStartX);
+                var diffY = Math.abs(event.stageY - clickStartY);
+                if (diffX > 10 || diffY > 10) return;
+
+                // 3. 좌표 변환 및 전송
+                var pos = viewer.scene.globalToLocal(event.stageX, event.stageY);
+                console.log("👆 클릭 감지됨! 좌표:", pos.x, -pos.y); // F12 콘솔 확인용
+
+                if (currentMode === 'GOAL') sendGoal(pos.x, -pos.y);
+                else sendInitialPose(pos.x, -pos.y);
+            });
+        }
+
+        // --- 이하 유틸리티 함수 ---
+        function centerOnRobot() {
+            if (!robotMarker) return;
+            viewer.scene.x = (viewer.width / 2) - (robotMarker.x * viewer.scene.scaleX);
+            viewer.scene.y = (viewer.height / 2) - (-robotMarker.y * viewer.scene.scaleY);
+        }
+
+        function sendGoal(x, y) {
+            isStopping = false;
+            document.getElementById('status-msg').innerText = `🚀 이동: [${x.toFixed(2)}, ${y.toFixed(2)}]`;
+            var topic = new ROSLIB.Topic({ ros : ros, name : '/goal_pose', messageType : 'geometry_msgs/msg/PoseStamped' });
+            var msg = new ROSLIB.Message({ header: { frame_id: "map" }, pose: { position: { x: x, y: y, z: 0 }, orientation: { w: 1.0 } } });
+            topic.publish(msg);
+        }
+
+        function sendInitialPose(x, y) {
+            var topic = new ROSLIB.Topic({ ros : ros, name : '/initialpose', messageType : 'geometry_msgs/msg/PoseWithCovarianceStamped' });
+            var msg = new ROSLIB.Message({ header: { frame_id: "map" }, pose: { pose: { position: { x: x, y: y, z: 0 }, orientation: { w: 1.0 } }, covariance: [0.25, 0, 0, 0, 0, 0, 0, 0.25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.06] } });
+            topic.publish(msg);
+            setMode('GOAL');
+            document.getElementById('status-msg').innerText = "📍 위치 보정 완료";
+        }
+
+        function stopRobot() {
+            isStopping = true; 
+            document.getElementById('status-msg').innerText = "🛑 정지 중...";
+            sendGoal(robotMarker.x, -robotMarker.y); // 현재 위치를 목적지로
+            var cmdVel = new ROSLIB.Topic({ ros: ros, name: '/cmd_vel', messageType: 'geometry_msgs/msg/Twist' });
+            var twist = new ROSLIB.Message({ linear: { x: 0, y: 0, z: 0 }, angular: { x: 0, y: 0, z: 0 } });
+            var count = 0;
+            var stopInterval = setInterval(() => { cmdVel.publish(twist); count++; if(count > 10) clearInterval(stopInterval); }, 50);
+        }
+
+        function setMode(mode) {
+            currentMode = mode;
+            document.getElementById('btn-goal').className = (mode === 'GOAL' ? 'btn-mode active' : 'btn-mode');
+            document.getElementById('btn-pose').className = (mode === 'POSE' ? 'btn-mode active' : 'btn-mode');
+        }
+    </script>
+</head>
+<body onload="init()">
+    <div id="header">
+        <div id="status-msg">시스템 연결 중...</div>
+        <div>MentorPi Mission Control (Fixed)</div>
+    </div>
+    <div id="map"></div>
+    <div class="footer">
+        <button id="btn-goal" class="btn-mode active" onclick="setMode('GOAL')">🎯 목적지 설정</button>
+        <button id="btn-pose" class="btn-mode" onclick="setMode('POSE')">📍 위치 보정</button>
+        <button class="btn-red" onclick="stopRobot()">🛑 즉시 정지</button>
+        <button class="btn-mode" onclick="centerOnRobot()">🔍 내 로봇 찾기</button>
+    </div>
+</body>
+</html>
