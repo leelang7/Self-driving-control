@@ -15,7 +15,7 @@ class ReturnHomeMecanum(Node):
         # === 튜닝 파라미터 ===
         self.LOOKAHEAD_DIST = 0.6   # 전방 주시 거리 (m)
         self.TARGET_SPEED = 0.25    # 복귀 속도 (m/s)
-        self.ROTATION_GAIN = 1.5    # 회전 민감도 (메카넘 전용)
+        self.ROTATION_GAIN = 1.5    # 회전 민감도
 
         # === 상태 변수 ===
         self.is_running = False
@@ -42,7 +42,8 @@ class ReturnHomeMecanum(Node):
                 self.get_logger().info("RETURN SEQUENCE STARTED!")
 
     def load_and_reverse_path(self):
-        file_path = 'path.csv'
+        # 경로 파일 위치 (환경에 맞게 수정 필요)
+        file_path = '/home/ubuntu/ros2_ws/src/my_package/my_package/path.csv'
         if not os.path.exists(file_path):
             self.get_logger().error(f"'{file_path}' not found!")
             return False
@@ -95,25 +96,39 @@ class ReturnHomeMecanum(Node):
             self.stop_robot()
             return
 
-        # 3. Pure Pursuit 계산 (메카넘 버전)
+        # 3. 메카넘 전용 벡터 주행 (Holonomic Drive)
         tx, ty = self.path[target_idx]
         dx = tx - self.x
         dy = ty - self.y
 
-        # 로봇 기준 좌표계 변환
+        # (1) 로봇 기준 좌표계로 변환 (내 앞이 X, 내 왼쪽이 Y)
         local_x = math.cos(-self.yaw) * dx - math.sin(-self.yaw) * dy
         local_y = math.sin(-self.yaw) * dx + math.cos(-self.yaw) * dy
 
-        # 곡률 계산
-        lookahead_sq = local_x**2 + local_y**2
-        curvature = 2.0 * local_y / lookahead_sq if lookahead_sq > 0 else 0.0
-
-        # 명령 생성
+        # (2) 거리 계산 및 속도 배분
+        dist_to_target = math.hypot(local_x, local_y)
+        
         cmd = Twist()
-        cmd.linear.x = self.TARGET_SPEED
-        cmd.linear.y = 0.0
-        # 각속도 = 선속도 * 곡률 * 게인
-        cmd.angular.z = (curvature * self.TARGET_SPEED) * self.ROTATION_GAIN
+        
+        if dist_to_target > 0.05:
+            # 거리 비율에 맞춰 X, Y 속도 배분 (메카넘 핵심)
+            # local_x가 음수면 후진, local_y가 있으면 게걸음
+            scale = self.TARGET_SPEED / dist_to_target
+            cmd.linear.x = local_x * scale
+            cmd.linear.y = local_y * scale 
+        else:
+            cmd.linear.x = 0.0
+            cmd.linear.y = 0.0
+
+        # (3) 방향 보정 (목표 지점을 바라보도록 회전)
+        target_yaw = math.atan2(dy, dx)
+        yaw_error = target_yaw - self.yaw
+        
+        # 각도 에러 정규화 (-pi ~ pi)
+        while yaw_error > math.pi: yaw_error -= 2 * math.pi
+        while yaw_error < -math.pi: yaw_error += 2 * math.pi
+
+        cmd.angular.z = yaw_error * self.ROTATION_GAIN
 
         self.pub_cmd.publish(cmd)
 
