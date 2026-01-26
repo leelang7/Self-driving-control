@@ -94,23 +94,19 @@ class IntegratedFleetNode(Node):
             cv2.putText(img, f"{r}m", (self.CENTER + 5, self.CENTER - radius + 12), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLOR_TEXT, 1, cv2.LINE_AA)
 
-        # ★ [추가] 각도 그리드 (Angle Lines) - 45도 간격
+        # 2. 각도 그리드 (Angle Lines) - 45도 간격
         max_r_pixel = int(self.MAX_DIST * self.SCALE)
         for angle in range(0, 360, 45):
             rad = math.radians(angle)
-            
-            # 라이다 점들과 좌표계를 맞추기 위해 x, y 모두 '-' 연산 사용
-            # (0도가 위쪽, 90도가 왼쪽 기준인 라이다 데이터와 정렬)
+            # 좌표 계산 (위쪽이 전방이므로 둘 다 '-')
             x_end = self.CENTER - int(max_r_pixel * math.sin(rad))
             y_end = self.CENTER - int(max_r_pixel * math.cos(rad))
             
-            # 선 그리기
             cv2.line(img, (self.CENTER, self.CENTER), (x_end, y_end), COLOR_GRID, 1, cv2.LINE_AA)
             
-            # 각도 텍스트 좌표 (선 끝보다 조금 더 바깥쪽)
+            # 텍스트 좌표 계산
             text_x = self.CENTER - int((max_r_pixel + 20) * math.sin(rad)) - 15
             text_y = self.CENTER - int((max_r_pixel + 20) * math.cos(rad)) + 5
-            
             cv2.putText(img, f"{angle}", (text_x, text_y), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLOR_TEXT, 1, cv2.LINE_AA)
 
@@ -118,7 +114,7 @@ class IntegratedFleetNode(Node):
         cv2.line(img, (self.CENTER, 0), (self.CENTER, self.MAP_SIZE), COLOR_GRID, 1)
         cv2.line(img, (0, self.CENTER), (self.MAP_SIZE, self.CENTER), COLOR_GRID, 1)
 
-        # 2. 라이다 데이터 그리기
+        # 3. 라이다 데이터 그리기
         if self.latest_scan:
             ranges = np.array(self.latest_scan.ranges)
             angle_min = self.latest_scan.angle_min
@@ -127,14 +123,13 @@ class IntegratedFleetNode(Node):
             for i, r in enumerate(ranges):
                 if 0.1 < r < self.MAX_DIST:
                     theta = angle_min + i * angle_inc
-                    # 좌표 계산 (위쪽이 전방)
                     x = self.CENTER - int(r * self.SCALE * math.sin(theta)) 
                     y = self.CENTER - int(r * self.SCALE * math.cos(theta))
                     
                     if 0 <= x < self.MAP_SIZE and 0 <= y < self.MAP_SIZE:
                         cv2.circle(img, (x, y), 1, COLOR_LIDAR, -1, cv2.LINE_AA)
 
-            # 3. 헤딩 라인 및 텍스트 (보정 적용)
+            # 4. 헤딩 화살표 및 텍스트
             corrected_yaw = self.latest_imu_yaw + self.imu_offset
             heading_deg = math.degrees(corrected_yaw)
             
@@ -142,12 +137,12 @@ class IntegratedFleetNode(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
             
             imu_len = self.MAP_SIZE // 3
-            # 좌표 계산 (라이다와 동일하게 '-' 사용해야 위쪽으로 그려짐)
             imu_x = self.CENTER - int(imu_len * math.sin(corrected_yaw))
             imu_y = self.CENTER - int(imu_len * math.cos(corrected_yaw))
             
-            cv2.line(img, (self.CENTER, self.CENTER), (imu_x, imu_y), COLOR_HEADING, 2, cv2.LINE_AA)
-            cv2.circle(img, (imu_x, imu_y), 4, COLOR_HEADING, -1)
+            # ★ [수정] 선과 원 대신 화살표 그리기 (tipLength로 화살촉 크기 조절)
+            cv2.arrowedLine(img, (self.CENTER, self.CENTER), (imu_x, imu_y), 
+                            COLOR_HEADING, 2, cv2.LINE_AA, tipLength=0.1)
 
         else:
             cv2.putText(img, f"ID: {ROBOT_ID} | SCANNING...", (10, 30), 
@@ -171,7 +166,6 @@ class IntegratedFleetNode(Node):
 
         lidar_img = self.draw_premium_radar()
         
-        # 이미지 가로 폭 맞추기
         if cam_img.shape[1] != lidar_img.shape[1]:
             lidar_img = cv2.resize(lidar_img, (cam_img.shape[1], 400))
             
